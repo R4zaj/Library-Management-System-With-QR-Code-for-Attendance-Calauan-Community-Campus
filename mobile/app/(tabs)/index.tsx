@@ -1,0 +1,1017 @@
+import React, { useState, useCallback } from 'react';
+import { View, Text, StyleSheet, ScrollView, Image, TouchableOpacity, Pressable, Dimensions, useWindowDimensions, Alert, Modal, Animated, ActivityIndicator, RefreshControl } from 'react-native';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useRouter, useFocusEffect } from 'expo-router';
+import { useAppTheme } from '../../context/ThemeContext';
+import { useLanguage } from '../../context/LanguageContext';
+import { useAuth } from '../../context/AuthContext';
+import { Bell, Settings, Flame, ArrowRight, ScanLine, BookOpen, Bookmark, Calendar, ChevronRight, Clock, TrendingUp, Megaphone, Star, Users, Check, X, Activity, ArrowRightLeft, DollarSign, ExternalLink, AlertCircle, Heart, CircleUser, ArrowLeft } from 'lucide-react-native';
+import * as Haptics from 'expo-haptics';
+import api from '../../api';
+import { useFavorites } from '../../context/FavoritesContext';
+import type {
+  Announcement,
+  DashboardNotification,
+  BorrowRecordWithBook,
+  LiteratureBook,
+  AttendanceLog,
+  UserPenaltiesResponse,
+} from '../../types/api';
+import { TabBarVisibilityContext } from './_layout';
+import { BookDetailModal } from '../../components/BookDetailModal';
+
+const { width, height } = Dimensions.get('window');
+
+function formatTimeAgo(dateString: string) {
+  const diff = Date.now() - new Date(dateString).getTime();
+  const minutes = Math.floor(diff / 60000);
+  const hours = Math.floor(minutes / 60);
+  const days = Math.floor(hours / 24);
+  if (days > 0) return `${days}d`;
+  if (hours > 0) return `${hours}h`;
+  if (minutes > 0) return `${minutes}m`;
+  return 'Just now';
+}
+
+export default function Home() {
+  const { theme } = useAppTheme();
+  const { t } = useLanguage();
+  const styles = getStyles(theme);
+  const { user } = useAuth();
+  const { isFavorite, toggleFavorite } = useFavorites();
+  const router = useRouter();
+  const [announcements, setAnnouncements] = useState<DashboardNotification[]>([]);
+  const [activeBorrows, setActiveBorrows] = useState<BorrowRecordWithBook[]>([]);
+  const [books, setBooks] = useState<LiteratureBook[]>([]);
+  const [selectedBook, setSelectedBook] = useState<LiteratureBook | null>(null);
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [fetchError, setFetchError] = useState(false);
+  const fadeAnim = React.useRef(new Animated.Value(0)).current;
+  const insets = useSafeAreaInsets();
+  const { height: windowHeight } = useWindowDimensions();
+
+  // New states for interactive cards
+  const { setTabBarVisible } = React.useContext(TabBarVisibilityContext);
+  const lastOffsetY = React.useRef(0);
+  const [attendanceLogs, setAttendanceLogs] = useState<AttendanceLog[]>([]);
+  const [penaltyRange, setPenaltyRange] = useState<'day' | 'week' | 'all'>('all');
+  const [penaltyData, setPenaltyData] = useState<UserPenaltiesResponse | null>(null);
+  const [penaltiesModalOpen, setPenaltiesModalOpen] = useState(false);
+
+  const fetchDashboardData = useCallback(async () => {
+    if (!user?.id) return; // don't hit authenticated-adjacent endpoints before login resolves
+
+    // Each source degrades to an empty fallback on its own failure (so one broken
+    // endpoint doesn't blank the whole dashboard), but `hadError` still records that
+    // it happened — otherwise a fully-down backend and a brand-new empty account
+    // render identically, with no signal that anything actually failed.
+    let hadError = false;
+    const safeGet = async <T,>(promise: Promise<{ data: T }>, fallback: T): Promise<{ data: T }> => {
+      try {
+        return await promise;
+      } catch (e) {
+        hadError = true;
+        return { data: fallback };
+      }
+    };
+
+    try {
+      const [annRes, borrowRes, booksRes, attendanceRes, penaltiesRes] = await Promise.all([
+        safeGet<Announcement[]>(api.get<Announcement[]>('/announcements/active'), []),
+        user?.id
+          ? safeGet<BorrowRecordWithBook[]>(api.get<BorrowRecordWithBook[]>(`/borrowing/user/${user.id}`), [])
+          : Promise.resolve({ data: [] as BorrowRecordWithBook[] }),
+        safeGet<LiteratureBook[]>(api.get<LiteratureBook[]>('/literatures/books'), []),
+        safeGet<AttendanceLog[]>(api.get<AttendanceLog[]>('/attendance/my-history'), []),
+        user?.id
+          ? safeGet<UserPenaltiesResponse | null>(api.get<UserPenaltiesResponse>(`/borrowing/user/${user.id}/penalties`), null)
+          : Promise.resolve({ data: null }),
+      ]);
+
+      setActiveBorrows(borrowRes.data);
+      setBooks((booksRes.data || []).filter((b) => !b.is_archived));
+      setAttendanceLogs(attendanceRes.data);
+      if (penaltiesRes.data) {
+        setPenaltyData(penaltiesRes.data);
+      }
+
+      const liveDailyRate = penaltiesRes.data?.rules?.penalty_fee_per_day ?? 5.0;
+      const rawAnnouncements = annRes.data || [];
+      const rawBorrows = borrowRes.data || [];
+      const now = new Date();
+      const overdueNotifications: DashboardNotification[] = [];
+      const seenOverdueBookIds = new Set();
+      
+      rawBorrows
+        .filter((b) => b.status === 'OVERDUE' || (b.status === 'BORROWED' && new Date(b.due_date) < now))
+        .forEach((b) => {
+          if (!seenOverdueBookIds.has(b.book_id)) {
+            seenOverdueBookIds.add(b.book_id);
+            const fallbackDays = Math.max(1, Math.abs(Math.ceil((new Date(b.due_date).getTime() - now.getTime()) / (1000 * 3600 * 24))));
+            const daysOverdue = b.penalty_info && b.penalty_info.days_overdue > 0 ? b.penalty_info.days_overdue : fallbackDays;
+            const rate = b.penalty_info?.daily_rate ?? liveDailyRate;
+            const feeAmount = b.penalty_info && b.penalty_info.amount > 0 ? b.penalty_info.amount : daysOverdue * rate;
+            overdueNotifications.push({
+              id: `overdue-${b.id}`,
+              title: 'Book Overdue',
+              body: `"${b.book?.title}" is ${daysOverdue} day${daysOverdue !== 1 ? 's' : ''} overdue • Penalty: ₱${feeAmount.toFixed(2)} (₱${rate.toFixed(2)}/day). Please return it immediately.`,
+              created_at: b.due_date,
+              is_overdue: true,
+            });
+          }
+        });
+
+      setAnnouncements([...overdueNotifications, ...rawAnnouncements]);
+      setFetchError(hadError);
+    } catch (err) {
+      console.error('Failed to fetch dashboard data', err);
+      setFetchError(true);
+    } finally {
+      setIsLoading((prev) => {
+        if (prev) {
+          Animated.timing(fadeAnim, {
+            toValue: 1,
+            duration: 600,
+            useNativeDriver: false,
+          }).start();
+        }
+        return false;
+      });
+    }
+  }, [user?.id]);
+
+  useFocusEffect(
+    useCallback(() => {
+      fetchDashboardData();
+      const interval = setInterval(fetchDashboardData, 30000); // refresh every 30s, only while this tab is focused
+      return () => clearInterval(interval);
+    }, [fetchDashboardData])
+  );
+
+  const currentDate = new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+
+  const greetingWord = (() => {
+    const hour = new Date().getHours();
+    if (hour < 12) return 'Good morning';
+    if (hour < 18) return 'Good afternoon';
+    return 'Good evening';
+  })();
+
+  const announcementsCount = announcements.length;
+
+  return (
+    <SafeAreaView style={{ flex: 1, backgroundColor: theme.background }}>
+      {isLoading ? (
+        <View style={{ flex: 1, paddingHorizontal: 16, paddingTop: 20, gap: 24 }}>
+          {/* Greeting Skeleton */}
+          <View>
+            <View style={{ width: 120, height: 14, backgroundColor: theme.border, borderRadius: 4, marginBottom: 8 }} />
+            <View style={{ width: 200, height: 28, backgroundColor: theme.border, borderRadius: 8 }} />
+          </View>
+          {/* Assistant Skeleton */}
+          <View style={{ height: 76, backgroundColor: theme.card, borderRadius: 24, borderWidth: 1, borderColor: theme.border }} />
+          {/* Grid Skeleton */}
+          <View style={{ flexDirection: 'row', gap: 12 }}>
+            <View style={{ flex: 1, height: 140, backgroundColor: theme.card, borderRadius: 24, borderWidth: 1, borderColor: theme.border }} />
+            <View style={{ flex: 1, height: 140, backgroundColor: theme.card, borderRadius: 24, borderWidth: 1, borderColor: theme.border }} />
+          </View>
+          {/* Borrows Skeleton */}
+          <View style={{ height: 200, backgroundColor: theme.card, borderRadius: 24, borderWidth: 1, borderColor: theme.border }} />
+        </View>
+      ) : (
+        <Animated.ScrollView 
+          style={[styles.container, { opacity: fadeAnim }]} 
+          contentContainerStyle={{ paddingBottom: insets.bottom + 98 }}
+          showsVerticalScrollIndicator={false}
+          refreshControl={
+            <RefreshControl
+              refreshing={isRefreshing}
+              onRefresh={async () => {
+                setIsRefreshing(true);
+                try {
+                  await fetchDashboardData();
+                } finally {
+                  setIsRefreshing(false);
+                }
+              }}
+              tintColor={theme.primary}
+              colors={[theme.primary]}
+            />
+          }
+          onScroll={(e) => {
+            const offsetY = e.nativeEvent.contentOffset.y;
+            if (offsetY <= 0) {
+              setTabBarVisible(true);
+            } else if (offsetY > lastOffsetY.current + 10) {
+              setTabBarVisible(false);
+            } else if (offsetY < lastOffsetY.current - 10) {
+              setTabBarVisible(true);
+            }
+            lastOffsetY.current = offsetY;
+          }}
+          scrollEventThrottle={16}
+        >
+        {/* Top Utility Bar */}
+      <View style={styles.topUtilityBar}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+          <Image
+            source={require('../../assets/images/CCC_icon.png')}
+            style={{ width: 34, height: 34 }}
+            resizeMode="contain"
+          />
+          <View style={styles.streakPill}>
+            <Flame color="#f97316" size={16} fill="#f97316" />
+            <Text style={styles.streakCount}>{user?.stats?.streak || 0}</Text>
+            <Text style={styles.streakText}>day streak</Text>
+          </View>
+        </View>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+          <TouchableOpacity
+            style={styles.actionChip}
+            onPress={() => setNotificationsOpen(true)}
+            hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+            accessibilityRole="button"
+            accessibilityLabel="Notifications"
+          >
+            <Bell color={theme.text} size={20} />
+            {announcementsCount > 0 && <View style={styles.badge}><Text style={styles.badgeText}>{announcementsCount}</Text></View>}
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={styles.actionChip}
+            onPress={() => router.push('/settings')}
+            hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+            accessibilityRole="button"
+            accessibilityLabel="Settings"
+          >
+            <Settings color={theme.text} size={20} />
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={styles.actionChip}
+            onPress={() => router.push('/profile')}
+            hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+            accessibilityRole="button"
+            accessibilityLabel="Profile"
+          >
+            <CircleUser color={theme.text} size={20} />
+          </TouchableOpacity>
+        </View>
+      </View>
+
+      {/* Greeting Header */}
+      <View style={styles.greetingHeader}>
+        <Text style={styles.overlineDate}>{currentDate.toUpperCase()}</Text>
+        <Text style={styles.greetingTitle}>{greetingWord}, {user?.first_name || 'Juan'}!</Text>
+      </View>
+
+      {/* Fetch error banner */}
+      {fetchError && (
+        <View style={styles.fetchErrorCard}>
+          <AlertCircle color="#dc2626" size={18} />
+          <Text style={styles.fetchErrorText}>Couldn't load dashboard data</Text>
+          <TouchableOpacity onPress={fetchDashboardData} hitSlop={{ top: 15, bottom: 15, left: 15, right: 15 }}>
+            <Text style={styles.fetchErrorRetry}>Tap to retry</Text>
+          </TouchableOpacity>
+        </View>
+      )}
+
+      {/* Streamlined Assistant Bubble */}
+      {announcements.length > 0 && (
+        <TouchableOpacity
+          activeOpacity={0.8}
+          style={styles.assistantCard}
+          onPress={() => setNotificationsOpen(true)}
+          accessibilityRole="button"
+          accessibilityLabel="View notifications"
+        >
+          <View style={styles.assistantIconTray}>
+            <Megaphone color={theme.primary} size={18} />
+          </View>
+          <View style={styles.assistantContent}>
+            <Text style={styles.assistantOverline}>{announcements[0].is_overdue ? 'URGENT' : 'ANNOUNCEMENT'}</Text>
+            <Text style={styles.assistantBody}>{announcements[0].title}: {announcements[0].body}</Text>
+          </View>
+        </TouchableOpacity>
+      )}
+
+      {/* Two-Column Mid-Tier Grid Cards */}
+      <View style={styles.gridContainer}>
+        {/* Left Card: Attendance */}
+        <View style={styles.gridCard}>
+          <Text style={styles.gridEyebrow}>LAST 7 DAYS</Text>
+          <View style={styles.chartContainer}>
+            {['S', 'M', 'T', 'W', 'T', 'F', 'S'].map((day, idx) => {
+              const todayIndex = new Date().getDay();
+              const isToday = todayIndex === idx;
+              
+              // Calculate date for this day of week in the past 7 days
+              const diff = todayIndex >= idx ? todayIndex - idx : 7 - (idx - todayIndex);
+              const targetDate = new Date();
+              targetDate.setDate(targetDate.getDate() - diff);
+              const targetDateString = targetDate.toLocaleDateString();
+
+              const logsForDay = attendanceLogs.filter(log => new Date(log.logged_at).toLocaleDateString() === targetDateString);
+              const totalMinutes = logsForDay.reduce((sum, log) => sum + (log.duration_minutes || 0), 0);
+              const totalHours = totalMinutes / 60;
+              
+              // Base height 4px for empty days, up to ~50px max (assuming 10 hours max)
+              const barHeight = Math.max(4, Math.min(50, totalHours * 5));
+
+              return (
+                <View key={idx} style={styles.chartCol}>
+                  <View style={styles.chartBarBg}>
+                    <View style={[styles.chartBarFill, { height: barHeight, backgroundColor: isToday ? theme.primary : theme.border }]} />
+                  </View>
+                  <Text style={styles.chartLabel}>{day}</Text>
+                </View>
+              );
+            })}
+          </View>
+        </View>
+
+        {/* Right Card: Penalties */}
+        {(() => {
+          const dailyRate = penaltyData?.rules?.penalty_fee_per_day ?? 5.0;
+          const totalUnpaid = penaltyData ? penaltyData.totalUnpaid : Number(user?.penalty_balance || 0);
+          const unpaidCount = penaltyData?.unpaidCount ?? 0;
+
+          const computeFallbackRange = (range: 'day' | 'week') => {
+            const nowMs = Date.now();
+            const overdues = activeBorrows.filter(
+              (b) => b.status === 'OVERDUE' || (b.status === 'BORROWED' && new Date(b.due_date).getTime() < nowMs)
+            );
+            let sum = 0;
+            overdues.forEach((b) => {
+              const d = b.penalty_info?.days_overdue || Math.max(1, Math.abs(Math.ceil((new Date(b.due_date).getTime() - nowMs) / (1000 * 3600 * 24))));
+              const r = b.penalty_info?.daily_rate ?? dailyRate;
+              if (range === 'day' && d > 0) sum += r;
+              if (range === 'week' && d > 0) sum += Math.min(d, 7) * r;
+            });
+            return sum;
+          };
+
+          const displayedAmount =
+            penaltyRange === 'all'
+              ? totalUnpaid
+              : penaltyRange === 'week'
+              ? penaltyData?.weekAccrual ?? computeFallbackRange('week')
+              : penaltyData?.todayAccrual ?? computeFallbackRange('day');
+
+          const hasUnpaid = totalUnpaid > 0;
+
+          return (
+            <View style={[styles.gridCard, hasUnpaid && { borderColor: '#fecaca' }]}>
+              <TouchableOpacity
+                activeOpacity={0.75}
+                onPress={() => {
+                  Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                  setPenaltiesModalOpen(true);
+                }}
+              >
+                <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                  <Text style={[styles.gridCardTitle, { marginBottom: 0 }]}>Penalties</Text>
+                  <ChevronRight size={16} color={hasUnpaid ? '#ef4444' : theme.textSecondary} />
+                </View>
+                <View style={styles.penaltyValueCont}>
+                  <Text style={[styles.currencySymbol, displayedAmount > 0 && { color: '#ef4444' }]}>₱</Text>
+                  <Text style={[styles.penaltyValue, displayedAmount > 0 && { color: '#ef4444' }]}>
+                    {displayedAmount.toFixed(2)}
+                  </Text>
+                </View>
+                <Text
+                  style={{
+                    fontSize: 11,
+                    fontWeight: '600',
+                    color: hasUnpaid ? '#dc2626' : theme.textSecondary,
+                    marginTop: 4,
+                  }}
+                  numberOfLines={1}
+                >
+                  {hasUnpaid
+                    ? `${unpaidCount || 1} unpaid • ₱${dailyRate.toFixed(2)}/day`
+                    : `Fee rate: ₱${dailyRate.toFixed(2)}/day`}
+                </Text>
+              </TouchableOpacity>
+
+              <View style={[styles.segmentedPill, { marginTop: 12 }]}>
+                {['Day', 'Week', 'All'].map((tab) => {
+                  const isActive = penaltyRange === tab.toLowerCase();
+                  return (
+                    <TouchableOpacity
+                      key={tab}
+                      onPress={() => {
+                        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                        setPenaltyRange(tab.toLowerCase() as 'day' | 'week' | 'all');
+                      }}
+                      hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                      style={[styles.segmentTab, isActive && styles.segmentTabActive]}
+                    >
+                      <Text style={[styles.segmentTabText, isActive && styles.segmentTabTextActive]}>{tab}</Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+            </View>
+          );
+        })()}
+      </View>
+
+      {/* Upcoming Borrows */}
+      <View style={styles.borrowsSection}>
+        <View style={styles.borrowsCard}>
+          <View style={styles.borrowsHeaderRow}>
+            <View style={styles.borrowsIconTray}>
+              <Calendar color={theme.primary} size={20} />
+            </View>
+            <View style={styles.borrowsHeaderContent}>
+              <Text style={styles.borrowsTitle}>Due Soon</Text>
+              <Text style={styles.borrowsSubtitle}>Active borrow return dates</Text>
+            </View>
+          </View>
+
+          {activeBorrows.length > 0 ? (
+            <View style={styles.borrowsList}>
+              {activeBorrows.slice(0, 3).map((borrow, idx) => {
+                const daysLeft = Math.ceil((new Date(borrow.due_date).getTime() - new Date().getTime()) / (1000 * 60 * 60 * 24));
+                const isOverdueItem = borrow.status === 'OVERDUE' || daysLeft < 0;
+                const dailyRate = borrow.penalty_info?.daily_rate ?? penaltyData?.rules?.penalty_fee_per_day ?? 5.0;
+                const overdueDays =
+                  borrow.penalty_info && borrow.penalty_info.days_overdue > 0
+                    ? borrow.penalty_info.days_overdue
+                    : Math.max(1, Math.abs(daysLeft));
+                const overdueFee =
+                  borrow.penalty_info && borrow.penalty_info.amount > 0
+                    ? borrow.penalty_info.amount
+                    : isOverdueItem
+                    ? overdueDays * dailyRate
+                    : 0;
+
+                let statusBg = '#ecfdf5';
+                let statusColor = '#10b981';
+                let statusText = 'Available';
+                
+                if (isOverdueItem) {
+                  statusBg = '#fef2f2';
+                  statusColor = '#ef4444';
+                  statusText = `Overdue by ${overdueDays} day${overdueDays !== 1 ? 's' : ''}`;
+                } else if (daysLeft <= 2) {
+                  statusBg = '#fef3c7';
+                  statusColor = '#b45309';
+                  statusText = daysLeft === 0 ? 'Due today' : `Due in ${daysLeft} day${daysLeft !== 1 ? 's' : ''}`;
+                } else {
+                  statusText = `${daysLeft} days left`;
+                }
+
+                return (
+                  <TouchableOpacity 
+                    key={borrow.id} 
+                    style={[styles.borrowRow, idx !== 0 && { borderTopWidth: 1, borderTopColor: theme.border }, { minHeight: 48 }]}
+                    activeOpacity={0.8}
+                    onPress={() => router.push('/borrowed')}
+                  >
+                    <View style={styles.borrowRowIcon}>
+                      <BookOpen color={theme.primary} size={16} />
+                    </View>
+                    <View style={styles.borrowRowContent}>
+                      <Text style={styles.borrowRowTitle} numberOfLines={1}>{borrow.book?.title || 'Unknown Book'}</Text>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: 6, marginTop: 4 }}>
+                        <View style={[styles.borrowStatusPill, { backgroundColor: statusBg }]}>
+                          <Text style={[styles.borrowStatusText, { color: statusColor, fontWeight: '700' }]}>{statusText}</Text>
+                        </View>
+                        {isOverdueItem && overdueFee > 0 && (
+                          <View style={[styles.borrowStatusPill, { backgroundColor: '#fff1f2' }]}>
+                            <Text style={[styles.borrowStatusText, { color: '#be123c', fontWeight: '800' }]}>
+                              ₱{overdueFee.toFixed(2)}
+                            </Text>
+                          </View>
+                        )}
+                        <Text style={styles.borrowRowDate}>{new Date(borrow.due_date).toLocaleDateString()}</Text>
+                      </View>
+                    </View>
+                    <TouchableOpacity 
+                      style={{ padding: 8, justifyContent: 'center', alignItems: 'center' }}
+                      hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+                      onPress={() => router.push('/scan')}
+                    >
+                      <ScanLine color={theme.textSecondary} size={20} />
+                    </TouchableOpacity>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+          ) : (
+             <View style={styles.borrowsEmpty}>
+               <Text style={styles.borrowsEmptyText}>No active books currently borrowed.</Text>
+             </View>
+          )}
+        </View>
+      </View>
+
+      {/* Section: Today's Highlight */}
+      {books.length > 0 && (
+        <>
+          <View style={styles.sectionHeader}>
+            <Text style={styles.sectionTitle}>Today's Highlight</Text>
+          </View>
+          <TouchableOpacity style={styles.highlightCard} onPress={() => setSelectedBook(books[0])}>
+            <View style={styles.highlightIconCont}>
+              <BookOpen color={theme.pillTextActive} size={40} opacity={0.85} />
+            </View>
+            <View style={styles.highlightContent}>
+              <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                <View style={styles.featuredTag}>
+                  <Star color="#fbbf24" size={12} fill="#fbbf24" />
+                  <Text style={styles.featuredTagText}>Featured Pick</Text>
+                </View>
+                <TouchableOpacity
+                  onPress={(e) => { 
+                    e.stopPropagation?.(); 
+                    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                    toggleFavorite(books[0]); 
+                  }}
+                  hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+                  style={{ padding: 4 }}
+                >
+                  <Heart
+                    color={isFavorite(books[0].id) ? '#ef4444' : theme.textSecondary}
+                    size={20}
+                    fill={isFavorite(books[0].id) ? '#ef4444' : 'none'}
+                  />
+                </TouchableOpacity>
+              </View>
+              <Text style={styles.highlightBookTitle} numberOfLines={2}>{books[0].title}</Text>
+              <Text style={styles.highlightBookAuthor} numberOfLines={1}>{books[0].author}</Text>
+              <View style={styles.unavailableTag}>
+                {books[0].available > 0 ? (
+                  <Text style={[styles.unavailableText, { color: '#10b981' }]}>Available ({books[0].available})</Text>
+                ) : (
+                  <Text style={styles.unavailableText}>Currently unavailable <ArrowRight size={12} color={theme.textSecondary} /></Text>
+                )}
+              </View>
+            </View>
+          </TouchableOpacity>
+        </>
+      )}
+
+
+
+
+      {/* Section: Recommended for You */}
+      {books.length > 1 && (
+        <>
+          <View style={[styles.sectionHeader, { justifyContent: 'space-between' }]}>
+            <Text style={styles.sectionTitle}>Recommended for You</Text>
+            <TouchableOpacity onPress={() => router.push('/search')} hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}>
+              <Text style={styles.seeAllText}>See All <ChevronRight size={14} color={theme.primary} /></Text>
+            </TouchableOpacity>
+          </View>
+          
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.recommendedScroll}>
+            {books.slice(1, 4).map((book, i) => (
+              <TouchableOpacity key={book.id} style={styles.recCard} onPress={() => setSelectedBook(book)}>
+                <View style={styles.recCover}>
+                  <View style={styles.recTypeTag}>
+                    <Text style={styles.recTypeText}>{book.genre || 'Book'}</Text>
+                  </View>
+                  <TouchableOpacity
+                    onPress={(e) => {
+                      e.stopPropagation?.();
+                      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                      toggleFavorite(book);
+                    }}
+                    hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+                    style={styles.recFavBtn}
+                  >
+                    <Heart
+                      color={isFavorite(book.id) ? '#ef4444' : theme.primary}
+                      size={18}
+                      fill={isFavorite(book.id) ? '#ef4444' : 'none'}
+                    />
+                  </TouchableOpacity>
+                  <BookOpen color={theme.primary} size={32} />
+                </View>
+                <View style={styles.recAvailRow}>
+                  <View style={[styles.dot, { backgroundColor: book.available > 0 ? '#10b981' : '#ef4444' }]} /> 
+                  <Text style={[styles.recAvailText, { color: book.available > 0 ? '#10b981' : '#ef4444' }]}>
+                    {book.available > 0 ? `${book.available} available` : 'Unavailable'}
+                  </Text>
+                </View>
+                <Text style={styles.recTitle} numberOfLines={2} ellipsizeMode="tail">{book.title}</Text>
+                <Text style={styles.recAuthor} numberOfLines={1}>{book.author}</Text>
+              </TouchableOpacity>
+            ))}
+          </ScrollView>
+        </>
+      )}
+
+      {/* Section: Trending in Your Department */}
+      {books.length > 4 && (
+        <>
+          <View style={styles.sectionHeader}>
+            <Text style={styles.sectionTitle}>Trending in Your Department</Text>
+          </View>
+          <View style={styles.trendingList}>
+            {books.slice(4, 9).map((book, idx) => (
+              <TouchableOpacity key={book.id} style={styles.trendingItem} onPress={() => setSelectedBook(book)}>
+                <View style={[styles.rankCircle, { backgroundColor: idx < 3 ? theme.primary : theme.background }]}>
+                  <Text style={[styles.rankText, { color: idx < 3 ? theme.pillTextActive : theme.primary }]}>{idx + 1}</Text>
+                </View>
+                <View style={styles.trendingInfo}>
+                  <Text style={styles.trendingTitle} numberOfLines={1} ellipsizeMode="tail">{book.title}</Text>
+                  <Text style={styles.trendingAuthor} numberOfLines={1} ellipsizeMode="tail">{book.author}</Text>
+                </View>
+                <TouchableOpacity
+                  onPress={(e) => { e.stopPropagation?.(); toggleFavorite(book); }}
+                  hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+                  style={{ padding: 6, marginRight: 4 }}
+                >
+                  <Heart
+                    color={isFavorite(book.id) ? '#ef4444' : '#cbd5e1'}
+                    size={18}
+                    fill={isFavorite(book.id) ? '#ef4444' : 'none'}
+                  />
+                </TouchableOpacity>
+                <View style={styles.trendingCount}>
+                  <Clock size={11} color={theme.textSecondary} strokeWidth={2} />
+                  <Text style={styles.countText}>{book.total} copies</Text>
+                </View>
+              </TouchableOpacity>
+            ))}
+          </View>
+        </>
+      )}
+
+      </Animated.ScrollView>
+      )}
+
+      {/* Book Detail Modal */}
+      <BookDetailModal
+        isOpen={!!selectedBook}
+        book={selectedBook}
+        onClose={() => setSelectedBook(null)}
+        isFavorite={selectedBook ? isFavorite(selectedBook.id) : false}
+        onToggleFavorite={() => selectedBook && toggleFavorite(selectedBook)}
+        penaltyPerDay={penaltyData?.rules?.penalty_fee_per_day}
+      />
+
+      {/* Penalty Fee Breakdown Modal */}
+      <Modal
+        animationType="fade"
+        transparent={true}
+        statusBarTranslucent={true}
+        visible={penaltiesModalOpen}
+        onRequestClose={() => setPenaltiesModalOpen(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <Pressable style={StyleSheet.absoluteFill} onPress={() => setPenaltiesModalOpen(false)} />
+          <View style={[styles.modalContent, { maxHeight: Math.round(windowHeight * 0.82), paddingBottom: 20 }]}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Penalty Fees</Text>
+              <TouchableOpacity
+                onPress={() => setPenaltiesModalOpen(false)}
+                hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+                accessibilityRole="button"
+                accessibilityLabel="Close penalty fees"
+                style={{ width: 44, height: 44, borderRadius: 22, backgroundColor: theme.background, borderWidth: 1, borderColor: theme.border, justifyContent: 'center', alignItems: 'center' }}
+              >
+                <X size={20} color={theme.textSecondary} />
+              </TouchableOpacity>
+            </View>
+
+            {(() => {
+              const totalUnpaid = penaltyData ? penaltyData.totalUnpaid : Number(user?.penalty_balance || 0);
+              const dailyRate = penaltyData?.rules?.penalty_fee_per_day ?? 5.0;
+              const damageFee = penaltyData?.rules?.damage_fee ?? 5.0;
+              const lostFee = penaltyData?.rules?.lost_book_fee ?? 5.0;
+              const items = penaltyData?.penalties || [];
+
+              return (
+                <>
+                  {/* Total Unpaid Banner */}
+                  <View
+                    style={{
+                      backgroundColor: totalUnpaid > 0 ? '#fef2f2' : '#ecfdf5',
+                      borderWidth: 1,
+                      borderColor: totalUnpaid > 0 ? '#fecaca' : '#a7f3d0',
+                      borderRadius: 16,
+                      padding: 16,
+                      marginBottom: 12,
+                      flexDirection: 'row',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                    }}
+                  >
+                    <View style={{ flex: 1, marginRight: 12 }}>
+                      <Text style={{ fontSize: 12, fontWeight: '700', color: totalUnpaid > 0 ? '#b91c1c' : '#047857', textTransform: 'uppercase' }}>
+                        Total Unpaid Penalty
+                      </Text>
+                      <Text style={{ fontSize: 12, fontWeight: '500', color: totalUnpaid > 0 ? '#dc2626' : '#059669', marginTop: 2 }}>
+                        {totalUnpaid > 0 ? 'Settle at the library circulation desk' : 'Your account is in good standing'}
+                      </Text>
+                    </View>
+                    <Text style={{ fontSize: 24, fontWeight: '800', color: totalUnpaid > 0 ? '#dc2626' : '#059669' }}>
+                      ₱{totalUnpaid.toFixed(2)}
+                    </Text>
+                  </View>
+
+                  {/* Library Penalty Fee Schedule */}
+                  <View
+                    style={{
+                      backgroundColor: theme.background,
+                      borderWidth: 1,
+                      borderColor: theme.border,
+                      borderRadius: 14,
+                      padding: 12,
+                      marginBottom: 14,
+                      flexDirection: 'row',
+                      justifyContent: 'space-between',
+                    }}
+                  >
+                    <View style={{ flex: 1, alignItems: 'center' }}>
+                      <Text style={{ fontSize: 11, color: theme.textSecondary, fontWeight: '600' }}>Overdue</Text>
+                      <Text style={{ fontSize: 13, color: theme.text, fontWeight: '800', marginTop: 2 }}>₱{dailyRate.toFixed(2)}/day</Text>
+                    </View>
+                    <View style={{ width: 1, backgroundColor: theme.border }} />
+                    <View style={{ flex: 1, alignItems: 'center' }}>
+                      <Text style={{ fontSize: 11, color: theme.textSecondary, fontWeight: '600' }}>Damaged</Text>
+                      <Text style={{ fontSize: 13, color: theme.text, fontWeight: '800', marginTop: 2 }}>₱{damageFee.toFixed(2)}</Text>
+                    </View>
+                    <View style={{ width: 1, backgroundColor: theme.border }} />
+                    <View style={{ flex: 1, alignItems: 'center' }}>
+                      <Text style={{ fontSize: 11, color: theme.textSecondary, fontWeight: '600' }}>Lost Book</Text>
+                      <Text style={{ fontSize: 13, color: theme.text, fontWeight: '800', marginTop: 2 }}>₱{lostFee.toFixed(2)}</Text>
+                    </View>
+                  </View>
+
+                  {/* Penalties List */}
+                  <ScrollView
+                    style={[styles.notifList, { maxHeight: Math.round(windowHeight * 0.45) }]}
+                    contentContainerStyle={{ paddingBottom: 4 }}
+                    showsVerticalScrollIndicator={false}
+                  >
+                    {items.length === 0 ? (
+                      <Text style={styles.noNotifsText}>No penalty records found.</Text>
+                    ) : (
+                      items.map((p) => {
+                        const isUnpaid = p.status === 'UNPAID';
+                        return (
+                          <View key={String(p.id)} style={styles.notifItem}>
+                            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                              <View style={{ flex: 1, marginRight: 12 }}>
+                                <Text style={styles.notifTitle} numberOfLines={2}>{p.book_title}</Text>
+                                <Text style={[styles.notifMessage, { marginTop: 3 }]}>
+                                  {p.days_overdue > 0 ? `${p.days_overdue} day${p.days_overdue !== 1 ? 's' : ''} overdue • ` : ''}
+                                  {p.is_returned ? 'Returned' : 'Not Returned'}
+                                </Text>
+                                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 6, flexWrap: 'wrap' }}>
+                                  <View
+                                    style={{
+                                      backgroundColor: isUnpaid ? '#fef2f2' : '#ecfdf5',
+                                      paddingHorizontal: 8,
+                                      paddingVertical: 2,
+                                      borderRadius: 9999,
+                                    }}
+                                  >
+                                    <Text style={{ fontSize: 10, fontWeight: '700', color: isUnpaid ? '#dc2626' : '#059669' }}>
+                                      {p.status}
+                                    </Text>
+                                  </View>
+                                  <Text style={{ fontSize: 11, color: theme.textSecondary, fontWeight: '500' }}>
+                                    {p.type} • ₱{Number(p.daily_rate || dailyRate).toFixed(2)}/day
+                                  </Text>
+                                  {!isUnpaid && p.receipt_number ? (
+                                    <View
+                                      style={{
+                                        backgroundColor: '#f1f5f9',
+                                        paddingHorizontal: 7,
+                                        paddingVertical: 2,
+                                        borderRadius: 4,
+                                        borderWidth: 1,
+                                        borderColor: '#e2e8f0',
+                                      }}
+                                    >
+                                      <Text style={{ fontSize: 10, fontWeight: '700', color: '#475569' }}>
+                                        Receipt: {p.receipt_number}
+                                      </Text>
+                                    </View>
+                                  ) : null}
+                                </View>
+                              </View>
+                              <Text style={{ fontSize: 17, fontWeight: '800', color: isUnpaid ? '#dc2626' : theme.text }}>
+                                ₱{Number(p.amount).toFixed(2)}
+                              </Text>
+                            </View>
+                          </View>
+                        );
+                      })
+                    )}
+                  </ScrollView>
+                </>
+              );
+            })()}
+          </View>
+        </View>
+      </Modal>
+
+      {/* Announcements Modal */}
+      <Modal
+        animationType="fade"
+        transparent={true}
+        statusBarTranslucent={true}
+        visible={notificationsOpen}
+        onRequestClose={() => setNotificationsOpen(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <Pressable style={StyleSheet.absoluteFill} onPress={() => setNotificationsOpen(false)} />
+          <View style={[styles.modalContent, { maxHeight: Math.round(windowHeight * 0.82), paddingBottom: 20 }]}>
+            {/* Header */}
+            <View style={styles.modalHeader}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1, marginRight: 12 }}>
+                <Text style={styles.modalTitle}>Notifications</Text>
+                {announcementsCount > 0 && (
+                  <View style={{ backgroundColor: theme.pillContainer, borderRadius: 9999, paddingHorizontal: 8, paddingVertical: 2, marginLeft: 8 }}>
+                    <Text style={{ fontSize: 12, fontWeight: '700', color: theme.primary }}>{announcementsCount}</Text>
+                  </View>
+                )}
+              </View>
+              <TouchableOpacity
+                onPress={() => setNotificationsOpen(false)}
+                hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+                accessibilityRole="button"
+                accessibilityLabel="Close notifications"
+                style={{ width: 44, height: 44, borderRadius: 22, backgroundColor: theme.background, borderWidth: 1, borderColor: theme.border, justifyContent: 'center', alignItems: 'center' }}
+              >
+                <X size={20} color={theme.textSecondary} />
+              </TouchableOpacity>
+            </View>
+
+            {/* List */}
+            <ScrollView
+              style={[styles.notifList, { maxHeight: Math.round(windowHeight * 0.6) }]}
+              contentContainerStyle={{ paddingBottom: 4 }}
+              showsVerticalScrollIndicator={false}
+            >
+              {announcements.length === 0 ? (
+                <Text style={styles.noNotifsText}>No new notifications</Text>
+              ) : (
+                announcements.map((a) => (
+                  <View key={a.id} style={styles.notifItem}>
+                    <View style={{ flexDirection: 'row' }}>
+                      <View style={[styles.notifIconWrapper, { backgroundColor: a.is_overdue ? '#fef2f2' : theme.pillContainer }]}>
+                        {a.is_overdue ? (
+                          <AlertCircle size={18} color="#ef4444" />
+                        ) : (
+                          <Megaphone size={18} color={theme.primary} />
+                        )}
+                      </View>
+                      <View style={styles.notifContent}>
+                        <View style={styles.notifTop}>
+                          <Text style={styles.notifTitle}>{a.title}</Text>
+                          <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                            <Text style={styles.notifTime}>{a.is_overdue ? 'Past Due' : formatTimeAgo(a.created_at)}</Text>
+                          </View>
+                        </View>
+                        <Text style={styles.notifMessage}>{a.body}</Text>
+                      </View>
+                    </View>
+                  </View>
+                ))
+              )}
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
+
+    </SafeAreaView>
+  );
+}
+
+const getStyles = (theme: any) => StyleSheet.create({
+  topUtilityBar: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 12, marginBottom: 24 },
+  streakPill: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#fff7ed', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 9999 },
+  streakCount: { fontSize: 14, fontWeight: '700', color: '#f97316', marginHorizontal: 6 },
+  streakText: { fontSize: 14, color: '#f97316', fontWeight: '500' },
+  topBarActions: { flexDirection: 'row', gap: 12 },
+  actionChip: { width: 40, height: 40, borderRadius: 16, backgroundColor: theme.card, justifyContent: 'center', alignItems: 'center', borderWidth: 1, borderColor: theme.border },
+  badge: { position: 'absolute', top: -4, right: -4, backgroundColor: '#ef4444', borderRadius: 10, width: 18, height: 18, justifyContent: 'center', alignItems: 'center', borderWidth: 1, borderColor: '#fff' },
+  badgeText: { color: theme.pillTextActive, fontSize: 10, fontWeight: 'bold' },
+  
+  greetingHeader: { marginBottom: 24 },
+  overlineDate: { fontSize: 12, fontWeight: '700', color: theme.textSecondary, letterSpacing: 1, marginBottom: 4 },
+  greetingTitle: { fontSize: 24, fontWeight: '800', color: theme.text },
+  
+  assistantCard: { flexDirection: 'row', backgroundColor: theme.card, borderRadius: 24, padding: 16, marginBottom: 24, borderWidth: 1, borderColor: theme.border, alignItems: 'center' },
+  assistantIconTray: { width: 44, height: 44, borderRadius: 12, backgroundColor: theme.pillContainer, justifyContent: 'center', alignItems: 'center', marginRight: 16 },
+  assistantContent: { flex: 1 },
+  assistantOverline: { fontSize: 12, fontWeight: '500', color: theme.primary, marginBottom: 2 },
+  assistantBody: { fontSize: 14, fontWeight: '500', color: theme.textSecondary, lineHeight: 20 },
+
+  gridContainer: { flexDirection: 'row', gap: 12, marginBottom: 24 },
+  gridCard: { flex: 1, backgroundColor: theme.card, borderRadius: 24, padding: 16, borderWidth: 1, borderColor: theme.border, justifyContent: 'space-between', minHeight: 140 },
+  gridEyebrow: { fontSize: 12, fontWeight: '500', color: theme.textSecondary, marginBottom: 16 },
+  chartContainer: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-end', height: 60, marginTop: 'auto' },
+  chartCol: { alignItems: 'center', gap: 4 },
+  chartBarBg: { height: 50, justifyContent: 'flex-end' },
+  chartBarFill: { width: 6, borderRadius: 4 },
+  chartLabel: { fontSize: 9, color: theme.textSecondary, fontWeight: '600' },
+  
+  gridCardTitle: { fontSize: 18, fontWeight: '600', color: theme.text, marginBottom: 8 },
+  penaltyValueCont: { flexDirection: 'row', alignItems: 'flex-start' },
+  currencySymbol: { fontSize: 14, fontWeight: '700', color: theme.textSecondary, marginTop: 2, marginRight: 2 },
+  penaltyValue: { fontSize: 24, fontWeight: '800', color: theme.text },
+  segmentedPill: { flexDirection: 'row', backgroundColor: theme.pillContainer, borderRadius: 9999, padding: 4, alignItems: 'center', marginTop: 16 },
+  segmentTab: { flex: 1, alignItems: 'center', justifyContent: 'center', minHeight: 32, borderRadius: 9999, backgroundColor: 'transparent' },
+  segmentTabActive: { backgroundColor: theme.card, elevation: 1, boxShadow: '0px 1px 2px rgba(0, 0, 0, 0.05)' },
+  segmentTabText: { fontSize: 12, fontWeight: '500', color: theme.textSecondary },
+  segmentTabTextActive: { fontWeight: '600', color: theme.text },
+
+  borrowsSection: { marginBottom: 32 },
+  borrowsCard: { backgroundColor: theme.card, borderRadius: 24, padding: 16, borderWidth: 1, borderColor: theme.border },
+  borrowsHeaderRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 16 },
+  borrowsIconTray: { width: 40, height: 40, borderRadius: 12, backgroundColor: theme.background, justifyContent: 'center', alignItems: 'center', marginRight: 12 },
+  borrowsHeaderContent: { flex: 1 },
+  borrowsTitle: { fontSize: 18, fontWeight: '600', color: theme.text },
+  borrowsSubtitle: { fontSize: 12, color: theme.textSecondary, fontWeight: '500' },
+  borrowsList: { gap: 0 },
+  borrowRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 12 },
+  borrowRowIcon: { width: 36, height: 36, borderRadius: 10, backgroundColor: theme.pillContainer, justifyContent: 'center', alignItems: 'center', marginRight: 12 },
+  borrowRowContent: { flex: 1, marginRight: 8 },
+  borrowRowTitle: { fontSize: 14, fontWeight: '500', color: theme.text, marginBottom: 2 },
+  borrowRowDate: { fontSize: 12, color: theme.textSecondary },
+  borrowStatusPill: { paddingHorizontal: 10, paddingVertical: 4, borderRadius: 9999 },
+  borrowStatusText: { fontSize: 12, fontWeight: '500' },
+  borrowsEmpty: { paddingVertical: 24, alignItems: 'center' },
+  borrowsEmptyText: { fontSize: 14, color: theme.textSecondary },
+
+
+  container: { flex: 1, backgroundColor: theme.background, paddingHorizontal: 16 },
+  
+  fetchErrorCard: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#fef3f2', borderWidth: 1, borderColor: '#fecaca', borderRadius: 14, paddingVertical: 10, paddingHorizontal: 14, marginBottom: 16, gap: 8 },
+  fetchErrorText: { flex: 1, fontSize: 12.5, color: '#b91c1c', fontWeight: '500' },
+  fetchErrorRetry: { fontSize: 12.5, color: theme.primary, fontWeight: '700' },
+
+  sectionHeader: { flexDirection: 'row', alignItems: 'center', marginTop: 8, marginBottom: 16 },
+  sectionTitle: { fontSize: 18, fontWeight: '600', color: theme.text },
+
+  highlightCard: { backgroundColor: theme.background, borderRadius: 24, padding: 20, flexDirection: 'row', marginBottom: 24, borderWidth: 1, borderColor: theme.border },
+  highlightIconCont: { width: 80, height: 110, backgroundColor: theme.primary, borderRadius: 12, justifyContent: 'center', alignItems: 'center', marginRight: 16 },
+  highlightContent: { flex: 1, justifyContent: 'center' },
+  featuredTag: { flexDirection: 'row', alignItems: 'center', marginBottom: 8 },
+  featuredTagText: { color: '#b45309', fontSize: 12, fontWeight: 'bold', marginLeft: 4 },
+  highlightBookTitle: { color: theme.text, fontSize: 18, fontWeight: '600', marginBottom: 4 },
+  highlightBookAuthor: { color: theme.textSecondary, fontSize: 14, fontWeight: '500', marginBottom: 12 },
+  unavailableTag: { alignSelf: 'flex-start', backgroundColor: theme.border, paddingHorizontal: 12, paddingVertical: 6, borderRadius: 12, flexDirection: 'row', alignItems: 'center' },
+  unavailableText: { color: theme.textSecondary, fontSize: 12, fontWeight: '500', marginRight: 4 },
+
+  seeAllText: { color: theme.primary, fontSize: 14, fontWeight: '600' },
+  recommendedScroll: { marginBottom: 24, marginLeft: -16, paddingLeft: 16 },
+  recCard: { width: 180, marginRight: 16, backgroundColor: theme.card, borderWidth: 1, borderColor: theme.border, borderRadius: 24, padding: 12 },
+  recCover: { height: 190, backgroundColor: theme.background, borderWidth: 1, borderColor: theme.border, borderRadius: 12, justifyContent: 'center', alignItems: 'center', position: 'relative' },
+  recTypeTag: { position: 'absolute', top: 10, left: 10, backgroundColor: theme.card, paddingHorizontal: 8, paddingVertical: 4, borderRadius: 9999 },
+  recTypeText: { fontSize: 12, fontWeight: '500', color: theme.primary },
+  recFavBtn: { position: 'absolute', bottom: 10, right: 10, width: 36, height: 36, borderRadius: 18, backgroundColor: theme.card, boxShadow: '0px 1px 4px rgba(0, 0, 0, 0.05)', elevation: 2, justifyContent: 'center', alignItems: 'center', zIndex: 2 },
+  recAvailRow: { flexDirection: 'row', alignItems: 'center', marginTop: 6, marginBottom: 4 },
+  dot: { width: 6, height: 6, borderRadius: 3, marginRight: 4 },
+  recAvailText: { fontSize: 12, fontWeight: '500' },
+  recTitle: { fontSize: 18, fontWeight: '600', color: theme.text, lineHeight: 22, marginBottom: 2 },
+  recAuthor: { fontSize: 14, fontWeight: '500', color: theme.textSecondary },
+
+  trendingList: { marginBottom: 24 },
+  trendingItem: { flexDirection: 'row', alignItems: 'center', backgroundColor: theme.card, padding: 16, borderRadius: 24, marginBottom: 8, borderWidth: 1, borderColor: theme.border },
+  rankCircle: { width: 32, height: 32, borderRadius: 16, justifyContent: 'center', alignItems: 'center', marginRight: 12 },
+  rankText: { fontSize: 14, fontWeight: 'bold' },
+  trendingInfo: { flex: 1 },
+  trendingTitle: { fontSize: 18, fontWeight: '600', color: theme.text, marginBottom: 2 },
+  trendingAuthor: { fontSize: 14, fontWeight: '500', color: '#6b7280' },
+  trendingCount: { marginLeft: 12, flexDirection: 'row', alignItems: 'center', gap: 4 },
+  countText: { fontSize: 12, fontWeight: '500', color: theme.textSecondary },
+
+  modalOverlay: { flex: 1, backgroundColor: 'rgba(30, 30, 46, 0.45)', justifyContent: 'center', alignItems: 'center', paddingHorizontal: 16 },
+  modalContent: { backgroundColor: theme.card, width: '100%', maxWidth: 440, borderRadius: 24, paddingTop: 22, paddingHorizontal: 18, elevation: 10 },
+  modalHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 },
+  modalTitle: { fontSize: 22, fontWeight: '800', color: theme.text },
+  markAllBtn: { flexDirection: 'row', alignItems: 'center' },
+  markAllText: { fontSize: 12, color: '#6b7280', marginLeft: 4 },
+  notifTabs: { flexDirection: 'row', borderBottomWidth: 1, borderBottomColor: theme.border, paddingHorizontal: 16 },
+  notifTab: { paddingVertical: 12, paddingHorizontal: 8, marginRight: 8, borderBottomWidth: 2, borderBottomColor: 'transparent' },
+  notifTabActive: { borderBottomColor: theme.primary },
+  notifTabText: { fontSize: 13, color: '#6b7280' },
+  notifTabTextActive: { fontWeight: 'bold', color: theme.primary },
+  notifList: { flexGrow: 0, flexShrink: 1 },
+  noNotifsText: { textAlign: 'center', padding: 32, color: theme.textSecondary, fontSize: 13 },
+  notifItem: { backgroundColor: theme.background, borderRadius: 16, padding: 16, marginBottom: 12, borderWidth: 1, borderColor: theme.border },
+  notifItemUnread: { backgroundColor: theme.background },
+  notifIconWrapper: { width: 40, height: 40, borderRadius: 12, justifyContent: 'center', alignItems: 'center', marginRight: 16 },
+  notifContent: { flex: 1 },
+  notifTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 4 },
+  notifTitle: { fontSize: 16, fontWeight: '600', color: theme.text, flex: 1, marginRight: 8 },
+  notifTitleUnread: { fontWeight: '600', color: theme.text },
+  unreadDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: theme.primary, marginRight: 6 },
+  notifTime: { fontSize: 12, fontWeight: '500', color: theme.textSecondary },
+  notifMessage: { fontSize: 14, fontWeight: '500', color: theme.textSecondary },
+  notifTrigger: { fontSize: 10, color: theme.textSecondary, marginTop: 4 },
+  notifFooter: { flexDirection: 'row', justifyContent: 'center', alignItems: 'center', padding: 16, backgroundColor: theme.background, borderTopWidth: 1, borderTopColor: theme.border },
+  notifFooterText: { fontSize: 14, fontWeight: 'bold', color: theme.primary, marginLeft: 8 },
+  closeModalBtn: { position: 'absolute', top: -50, right: 0, padding: 8, backgroundColor: 'rgba(0,0,0,0.5)', borderRadius: 20 }
+});
